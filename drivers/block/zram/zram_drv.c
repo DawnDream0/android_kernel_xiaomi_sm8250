@@ -2733,6 +2733,13 @@ static int zram_add(void)
 	}
 
 	blk_queue_make_request(queue, zram_make_request);
+	/* ========== zram 队列性能优化 ========== */
+	// 单次IO最大传输量：硬件上限设为2048KB（4096个512字节扇区）
+	blk_queue_max_hw_sectors(queue, 4096);
+	// 队列深度：从默认32提升至256，减少锁竞争
+	queue->nr_requests = 256;
+	// 标记为非旋转内存设备，启用IO合并与调度优化
+	blk_queue_nonrot(queue);
 
 	/* gendisk structure */
 	zram->disk = alloc_disk(1);
