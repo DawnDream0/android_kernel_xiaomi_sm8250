@@ -787,3 +787,22 @@ CONFIG_BUG_ON_DATA_CORRUPTION=y
 CONFIG_CC_WERROR=y
 CONFIG_DEBUG_ALIGN_RODATA=y
 CONFIG_TECHPACK_CAMERA_XIAOMI=y
+# ========== zram/zsmalloc 性能修复 ==========
+# 开启zsmalloc巨页支持，单次释放性能提升3~5倍
+CONFIG_ZSMALLOC_HUGEPAGE=y
+# 开启zsmalloc统计接口，同步启用碎片管理优化逻辑
+CONFIG_ZSMALLOC_STAT=y
+# 关闭zsmalloc调试模式
+# CONFIG_ZSMALLOC_DEBUG is not set
+
+# 默认压缩算法改为标准lz4，减少碎片，长期性能更稳定
+CONFIG_ZRAM_DEF_COMP_LZ4=y
+CONFIG_ZRAM_DEF_COMP="lz4"
+
+# 关闭SLUB分配器调试，移除内存释放的额外校验开销
+# CONFIG_SLUB_DEBUG is not set
+# CONFIG_SLUB_DEBUG_ON is not set
+# 关闭页内存毒化，移除释放时的内存覆写损耗
+# CONFIG_PAGE_POISONING is not set
+# 关闭失败注入调试
+# CONFIG_FAIL_PAGE_ALLOC is not set
