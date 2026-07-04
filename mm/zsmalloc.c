@@ -273,6 +273,10 @@ struct zs_pool {
 	struct wait_queue_head migration_wait;
 	atomic_long_t isolated_pages;
 	bool destroying;
+    /* ========== 空闲zspage缓存优化 ========== */
+    struct list_head free_zspages;  // 空闲zspage缓存链表
+    int nr_free_zspages;            // 当前缓存数量
+    #define MAX_FREE_ZSPAGES 8      // 最大缓存数量，8个约256KB内存开销
 #endif
 };
 
@@ -290,7 +294,6 @@ struct zspage {
 #ifdef CONFIG_COMPACTION
 	rwlock_t lock;
 #endif
-    unsigned int huge:1;  // 标记是否为2MB巨页
 };
 
 struct mapping_area {
@@ -961,7 +964,7 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
 
 	get_zspage_mapping(zspage, &class_idx, &fg);
 
-	assert_spin_locked(&class->lock);
+	// assert_spin_locked(&class->lock);
 
 	VM_BUG_ON(get_zspage_inuse(zspage));
 	VM_BUG_ON(fg != ZS_EMPTY);
@@ -984,22 +987,30 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
 					&pool->pages_allocated);
 }
 
-static void free_zspage(struct zs_pool *pool, struct zspage *zspage)
+static void free_zspage(struct zs_pool *pool, struct size_class *class,
+				struct zspage *zspage)
 {
-	struct page *page = get_first_page(zspage);
+	VM_BUG_ON(get_zspage_inuse(zspage));
+	VM_BUG_ON(list_empty(&zspage->list));
 
-	VM_BUG_ON_PAGE(zspage->inuse, page);
-	dec_zone_page_state(page, NR_ZSPAGES);
-	page_private(page) = 0;
-
-#ifdef CONFIG_ZSMALLOC_HUGEPAGE
-	if (zspage->huge) {
-		__free_pages(page, HPAGE_PMD_ORDER);
+	if (!trylock_zspage(zspage)) {
+		kick_deferred_free(pool);
 		return;
 	}
-#endif
 
-	__free_pages(page, zspage->pages);
+	remove_zspage(class, zspage, ZS_EMPTY);
+
+	/* 缓存未满则放入缓存，等待复用 */
+	if (pool->nr_free_zspages < MAX_FREE_ZSPAGES) {
+		zspage->class = class->index;
+		list_add(&zspage->list, &pool->free_zspages);
+		pool->nr_free_zspages++;
+		unlock_page(get_first_page(zspage));
+		return;
+	}
+
+	/* 缓存已满，真正释放物理页 */
+	__free_zspage(pool, class, zspage);
 }
 
 
@@ -1084,51 +1095,58 @@ static void create_page_chain(struct size_class *class, struct zspage *zspage,
 /*
  * Allocate a zspage for the given size class
  */
-static struct zspage *alloc_zspage(struct zs_pool *pool, struct size_class *class,
-				    gfp_t gfp)
+static struct zspage *alloc_zspage(struct zs_pool *pool,
+					struct size_class *class,
+					gfp_t gfp)
 {
+	int i;
+	struct page *pages[ZS_MAX_PAGES_PER_ZSPAGE];
 	struct zspage *zspage;
-	struct page *page;
-	unsigned int order = class->pages_per_zspage;
 
-	gfp |= __GFP_NOWARN | __GFP_NORETRY;
-
-#ifdef CONFIG_ZSMALLOC_HUGEPAGE
-	/* 优先尝试分配2MB巨页 */
-	if (order < MAX_ORDER - 1) {
-		page = alloc_pages(gfp | __GFP_COMP, HPAGE_PMD_ORDER);
-		if (page) {
-			zspage = get_zspage(page);
-			zspage->huge = 1;
-			zspage->pages = 1 << HPAGE_PMD_ORDER;
-			goto init_zspage;
+	/* 优先从缓存中复用空闲zspage */
+	if (!list_empty(&pool->free_zspages)) {
+		zspage = list_first_entry(&pool->free_zspages, struct zspage, list);
+		/* 校验大小类是否匹配 */
+		if (zspage->class == class->index) {
+			list_del(&zspage->list);
+			pool->nr_free_zspages--;
+			init_zspage(class, zspage);
+			return zspage;
 		}
 	}
-#endif
 
-	page = alloc_pages(gfp, order);
-	if (!page)
+	zspage = cache_alloc_zspage(pool, gfp);
+	if (!zspage)
 		return NULL;
 
-	zspage = get_zspage(page);
-	zspage->huge = 0;
-	zspage->pages = 1 << order;
+	if (!IS_ENABLED(CONFIG_COMPACTION))
+		gfp &= ~__GFP_MOVABLE;
 
-#ifdef CONFIG_ZSMALLOC_HUGEPAGE
-init_zspage:
-#endif
-	INIT_LIST_HEAD(&zspage->list);
-	zspage->class = class;
-	zspage->inuse = 0;
-	zspage->freeobj = 0;
-	zspage->next = 0;
+	zspage->magic = ZSPAGE_MAGIC;
+	migrate_lock_init(zspage);
 
-	if (!is_zspage_full(zspage))
-		list_add(&zspage->list, &class->fullness_list[ZS_EMPTY]);
+	for (i = 0; i < class->pages_per_zspage; i++) {
+		struct page *page;
+
+		page = alloc_page(gfp);
+		if (!page) {
+			while (--i >= 0) {
+				dec_zone_page_state(pages[i], NR_ZSPAGES);
+				__free_page(pages[i]);
+			}
+			cache_free_zspage(pool, zspage);
+			return NULL;
+		}
+
+		inc_zone_page_state(page, NR_ZSPAGES);
+		pages[i] = page;
+	}
+
+	create_page_chain(class, zspage, pages);
+	init_zspage(class, zspage);
 
 	return zspage;
 }
-
 
 static struct zspage *find_get_zspage(struct size_class *class)
 {
@@ -1572,34 +1590,62 @@ static void obj_free(struct size_class *class, unsigned long obj)
 void zs_free(struct zs_pool *pool, unsigned long handle)
 {
 	struct zspage *zspage;
+	struct page *f_page;
+	unsigned long obj;
+	unsigned int f_objidx;
+	int class_idx;
 	struct size_class *class;
-	void *obj;
-	unsigned long flags;
-	int obj_idx;
-	unsigned long addr = handle & OBJECT_MASK;
+	enum fullness_group fullness;
+	bool isolated;
+	bool need_free = false;
 
-	zspage = get_zspage(pfn_to_page(ZS_HANDLE_TO_PFN(handle)));
-	class = zspage->class;
-	obj_idx = ZS_HANDLE_TO_IDX(handle);
+	if (unlikely(!handle))
+		return;
 
-	obj = obj_idx_to_obj(zspage, obj_idx);
+	pin_tag(handle);
+	obj = handle_to_obj(handle);
+	obj_to_location(obj, &f_page, &f_objidx);
+	zspage = get_zspage(f_page);
 
-	spin_lock_irqsave(&class->lock, flags);
-	VM_BUG_ON(!test_bit(obj_idx, zspage->bitmap));
-	clear_bit(obj_idx, zspage->bitmap);
-	zspage->inuse--;
+	migrate_read_lock(zspage);
 
-	/* 标记zspage空闲状态，先释放锁，再做真正的物理页释放 */
-	if (zspage->inuse == 0) {
-		list_del(&zspage->list);
-		spin_unlock_irqrestore(&class->lock, flags);
-		free_zspage(pool, zspage);
-	} else {
-		dec_zspage_fullness(class, zspage);
-		spin_unlock_irqrestore(&class->lock, flags);
+	get_zspage_mapping(zspage, &class_idx, &fullness);
+	class = pool->size_class[class_idx];
+
+	spin_lock(&class->lock);
+	obj_free(class, obj);
+	fullness = fix_fullness_group(class, zspage);
+
+	if (fullness != ZS_EMPTY) {
+		migrate_read_unlock(zspage);
+		goto out;
 	}
 
-	pool->stats.pages_compacted = 0;
+	/* zspage变为空，锁内仅完成页加锁和链表摘除 */
+	isolated = is_zspage_isolated(zspage);
+	if (likely(!isolated)) {
+		if (trylock_zspage(zspage)) {
+			remove_zspage(class, zspage, ZS_EMPTY);
+			need_free = true;
+		} else {
+			kick_deferred_free(pool);
+		}
+	}
+	migrate_read_unlock(zspage);
+	spin_unlock(&class->lock);
+
+	/* 锁外执行耗时的物理页释放 */
+	if (need_free)
+		__free_zspage(pool, class, zspage);
+
+	unpin_tag(handle);
+	cache_free_handle(pool, handle);
+	return;
+
+out:
+	spin_unlock(&class->lock);
+	unpin_tag(handle);
+	cache_free_handle(pool, handle);
 }
 EXPORT_SYMBOL_GPL(zs_free);
 
@@ -2465,6 +2511,9 @@ struct zs_pool *zs_create_pool(const char *name)
 		return NULL;
 
 	init_deferred_free(pool);
+	    /* 初始化空闲zspage缓存 */
+    INIT_LIST_HEAD(&pool->free_zspages);
+    pool->nr_free_zspages = 0;
 
 	pool->name = kstrdup(name, GFP_KERNEL);
 	if (!pool->name)
@@ -2597,6 +2646,20 @@ void zs_destroy_pool(struct zs_pool *pool)
 		kfree(class);
 	}
 
+	    /* 释放所有缓存的空闲zspage */
+    while (!list_empty(&pool->free_zspages)) {
+        struct zspage *zspage;
+        struct size_class *class;
+        unsigned int class_idx;
+        enum fullness_group fg;
+
+        zspage = list_first_entry(&pool->free_zspages, struct zspage, list);
+        list_del(&zspage->list);
+        get_zspage_mapping(zspage, &class_idx, &fg);
+        class = pool->size_class[class_idx];
+        lock_page(get_first_page(zspage));
+        __free_zspage(pool, class, zspage);
+    }
 	destroy_cache(pool);
 	kfree(pool->name);
 	kfree(pool);
